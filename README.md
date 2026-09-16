@@ -83,7 +83,7 @@ s3-file-organizer/
 
 ## Demo video
 
-[Link to unlisted YouTube demo — TODO: add once recorded]
+
 
 ## What I'd add next
 
