@@ -91,7 +91,7 @@ s3-file-organizer/
 - A `--dry-run` flag for `organize` so you can preview moves before they happen
 - Basic logging instead of print statements
 - Error handling for missing/expired AWS credentials with clearer messages
-
+## WTC-KS95WMNR
 ## Author
 
 Sbongakonke Jele — WeThinkCode student, Cloud Computing elective (2nd choice)
