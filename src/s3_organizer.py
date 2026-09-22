@@ -1,6 +1,6 @@
 """
 S3 File Organizer
-A command-line tool for managing files in an AWS S3 bucket.
+A simple CLI tool for managing files in an AWS S3 bucket.
 
 Usage:
     python s3_organizer.py list-buckets
@@ -8,23 +8,27 @@ Usage:
     python s3_organizer.py upload <bucket-name> <local-file-path>
     python s3_organizer.py download <bucket-name> <s3-key> <local-destination>
     python s3_organizer.py organize <bucket-name> [--dry-run]
+    python s3_organizer.py --help
 """
 
+import argparse
+import logging
 import os
 import sys
-import logging
-import argparse
 
 import boto3
-from botocore.exceptions import ClientError, NoCredentialsError
+from boto3.exceptions import S3UploadFailedError
+from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
 logger = logging.getLogger("s3_organizer")
 
+
+def get_s3_client():
+    """Create and return an S3 client."""
+    return boto3.client("s3")
+
+
+# Which folder each file extension belongs in. Anything not listed goes to "other".
 EXTENSION_FOLDERS = {
     "jpg": "images", "jpeg": "images", "png": "images", "gif": "images",
     "pdf": "documents", "doc": "documents", "docx": "documents", "txt": "documents",
@@ -34,166 +38,151 @@ EXTENSION_FOLDERS = {
 }
 
 
-def get_s3_client():
-    """Create and return an S3 client."""
-    return boto3.client("s3")
+def get_folder_for_key(key):
+    """
+    Return the folder a file should be sorted into, based on its extension.
+    Pure logic (no AWS calls), so it is easy to unit test.
+
+    "photo.JPG" -> "images", "notes.xyz" -> "other", "README" -> "other"
+    """
+    _, extension = os.path.splitext(key)
+    return EXTENSION_FOLDERS.get(extension.lstrip(".").lower(), "other")
 
 
-def list_buckets(s3=None):
+def iter_objects(s3, bucket_name):
+    """
+    Yield every object in a bucket, one dict at a time.
+
+    S3 returns at most 1000 objects per request, so a single list_objects_v2
+    call silently misses everything after the first 1000. The paginator keeps
+    asking for the next page until the bucket is exhausted.
+    """
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket_name):
+        # An empty bucket returns a page with no "Contents" key at all
+        yield from page.get("Contents", [])
+
+
+def list_buckets():
     """List all S3 buckets in the account."""
-    s3 = s3 or get_s3_client()
-    try:
-        response = s3.list_buckets()
-        buckets = response.get("Buckets", [])
-        if not buckets:
-            logger.info("No buckets found in this account.")
-            return []
-        logger.info("Found %d bucket(s):", len(buckets))
-        for bucket in buckets:
-            print(f"  - {bucket['Name']} (created {bucket['CreationDate']})")
-        return buckets
-    except NoCredentialsError:
-        logger.error("AWS credentials not found. Run 'aws configure' first.")
-    except ClientError as e:
-        logger.error("Error listing buckets: %s", e)
-    return []
+    s3 = get_s3_client()
+    buckets = s3.list_buckets().get("Buckets", [])
+    if not buckets:
+        logger.info("No buckets found in this account.")
+        return
+    logger.info("Found %d bucket(s):", len(buckets))
+    for bucket in buckets:
+        logger.info("  - %s (created %s)", bucket["Name"], bucket["CreationDate"])
 
 
-def list_files(bucket_name, s3=None):
+def list_files(bucket_name):
     """List all objects/files in a given bucket."""
-    s3 = s3 or get_s3_client()
-    try:
-        response = s3.list_objects_v2(Bucket=bucket_name)
-        objects = response.get("Contents", [])
-        if not objects:
-            logger.info("No files found in bucket '%s'.", bucket_name)
-            return []
-        logger.info("Found %d file(s) in '%s':", len(objects), bucket_name)
-        for obj in objects:
-            size_kb = obj["Size"] / 1024
-            print(f"  - {obj['Key']} ({size_kb:.1f} KB)")
-        return objects
-    except ClientError as e:
-        logger.error("Error listing files: %s", e)
-        return []
+    s3 = get_s3_client()
+    objects = list(iter_objects(s3, bucket_name))
+    if not objects:
+        logger.info("No files found in bucket '%s'.", bucket_name)
+        return
+    logger.info("Found %d file(s) in '%s':", len(objects), bucket_name)
+    for obj in objects:
+        size_kb = obj["Size"] / 1024
+        logger.info("  - %s (%.1f KB)", obj["Key"], size_kb)
 
 
-def upload_file(bucket_name, local_path, s3=None):
+def upload_file(bucket_name, local_path):
     """Upload a local file to the given bucket."""
     if not os.path.isfile(local_path):
-        logger.error("Local file '%s' does not exist.", local_path)
-        return False
-    s3 = s3 or get_s3_client()
+        raise FileNotFoundError(f"local file '{local_path}' does not exist")
+    s3 = get_s3_client()
     file_name = os.path.basename(local_path)
-    try:
-        s3.upload_file(local_path, bucket_name, file_name)
-        logger.info("Uploaded '%s' to 's3://%s/%s'", local_path, bucket_name, file_name)
-        return True
-    except ClientError as e:
-        logger.error("Error uploading file: %s", e)
-        return False
+    s3.upload_file(local_path, bucket_name, file_name)
+    logger.info("Uploaded '%s' to 's3://%s/%s'", local_path, bucket_name, file_name)
 
 
-def download_file(bucket_name, s3_key, destination, s3=None):
+def download_file(bucket_name, s3_key, destination):
     """Download a file from the given bucket to a local destination."""
-    s3 = s3 or get_s3_client()
-    try:
-        s3.download_file(bucket_name, s3_key, destination)
-        logger.info("Downloaded 's3://%s/%s' to '%s'", bucket_name, s3_key, destination)
-        return True
-    except ClientError as e:
-        logger.error("Error downloading file: %s", e)
-        return False
+    s3 = get_s3_client()
+    s3.download_file(bucket_name, s3_key, destination)
+    logger.info("Downloaded 's3://%s/%s' to '%s'", bucket_name, s3_key, destination)
 
 
-def get_target_folder(key):
-    """Work out which folder a given S3 key should be organized into."""
-    extension = key.split(".")[-1].lower() if "." in key else ""
-    return EXTENSION_FOLDERS.get(extension, "other")
-
-
-def organize_bucket(bucket_name, s3=None, dry_run=False):
+def organize_bucket(bucket_name, dry_run=False):
     """
     Organize files in a bucket into folders by file extension.
     e.g. photo.jpg -> images/photo.jpg, report.pdf -> documents/report.pdf
 
-    If dry_run is True, prints what would happen without changing anything.
+    With dry_run=True, only report what would move; nothing in the bucket changes.
     """
-    s3 = s3 or get_s3_client()
-    try:
-        response = s3.list_objects_v2(Bucket=bucket_name)
-        objects = response.get("Contents", [])
-        if not objects:
-            logger.info("No files to organize in '%s'.", bucket_name)
-            return 0
+    s3 = get_s3_client()
+    # Collect the full listing first, so we never change the bucket while
+    # we are still paging through it
+    objects = list(iter_objects(s3, bucket_name))
+    if not objects:
+        logger.info("No files to organize in '%s'.", bucket_name)
+        return
 
-        moved_count = 0
-        for obj in objects:
-            key = obj["Key"]
-            # Skip files that are already organized (already in a folder)
-            if "/" in key:
-                continue
+    moved_count = 0
+    for obj in objects:
+        key = obj["Key"]
+        # Skip files that are already organized (already in a folder)
+        if "/" in key:
+            continue
 
-            folder = get_target_folder(key)
-            new_key = f"{folder}/{key}"
+        new_key = f"{get_folder_for_key(key)}/{key}"
 
-            if dry_run:
-                print(f"  [DRY RUN] Would move '{key}' -> '{new_key}'")
-                moved_count += 1
-                continue
-
+        if dry_run:
+            logger.info("  Would move '%s' -> '%s'", key, new_key)
+        else:
+            # Copy first, delete second: if the copy fails, the original is untouched
             s3.copy_object(
                 Bucket=bucket_name,
                 CopySource={"Bucket": bucket_name, "Key": key},
                 Key=new_key,
             )
             s3.delete_object(Bucket=bucket_name, Key=key)
-            print(f"  Moved '{key}' -> '{new_key}'")
-            moved_count += 1
+            logger.info("  Moved '%s' -> '%s'", key, new_key)
+        moved_count += 1
 
-        verb = "Would organize" if dry_run else "Organized"
-        logger.info("%s %d file(s) in '%s'.", verb, moved_count, bucket_name)
-        return moved_count
-    except ClientError as e:
-        logger.error("Error organizing bucket: %s", e)
-        return 0
+    if dry_run:
+        logger.info("Dry run: %d file(s) would be moved in '%s'. Nothing was changed.",
+                    moved_count, bucket_name)
+    else:
+        logger.info("Organized %d file(s) in '%s'.", moved_count, bucket_name)
 
 
 def build_parser():
+    """Describe the command line: which commands exist and what arguments they take."""
     parser = argparse.ArgumentParser(
-        prog="s3_organizer.py",
-        description="A CLI tool for managing files in an AWS S3 bucket.",
+        description="Manage and organize files in an AWS S3 bucket."
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    commands = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("list-buckets", help="List all S3 buckets in the account")
+    commands.add_parser("list-buckets", help="list all buckets in the account")
 
-    p_list_files = subparsers.add_parser("list-files", help="List files in a bucket")
-    p_list_files.add_argument("bucket", help="Name of the S3 bucket")
+    list_files_cmd = commands.add_parser("list-files", help="list all files in a bucket")
+    list_files_cmd.add_argument("bucket", help="bucket name")
 
-    p_upload = subparsers.add_parser("upload", help="Upload a local file to a bucket")
-    p_upload.add_argument("bucket", help="Name of the S3 bucket")
-    p_upload.add_argument("local_path", help="Path to the local file")
+    upload_cmd = commands.add_parser("upload", help="upload a local file to a bucket")
+    upload_cmd.add_argument("bucket", help="bucket name")
+    upload_cmd.add_argument("local_path", help="path of the local file to upload")
 
-    p_download = subparsers.add_parser("download", help="Download a file from a bucket")
-    p_download.add_argument("bucket", help="Name of the S3 bucket")
-    p_download.add_argument("s3_key", help="Key (path) of the file in the bucket")
-    p_download.add_argument("destination", help="Local destination path")
+    download_cmd = commands.add_parser("download", help="download a file from a bucket")
+    download_cmd.add_argument("bucket", help="bucket name")
+    download_cmd.add_argument("key", help="name (key) of the file in the bucket")
+    download_cmd.add_argument("destination", help="where to save the file locally")
 
-    p_organize = subparsers.add_parser("organize", help="Organize a bucket's files by type")
-    p_organize.add_argument("bucket", help="Name of the S3 bucket")
-    p_organize.add_argument(
+    organize_cmd = commands.add_parser(
+        "organize", help="sort loose files in a bucket into folders by type"
+    )
+    organize_cmd.add_argument("bucket", help="bucket name")
+    organize_cmd.add_argument(
         "--dry-run", action="store_true",
-        help="Preview what would be moved without actually moving anything",
+        help="show what would be moved without changing anything",
     )
-
     return parser
 
 
-def main():
-    parser = build_parser()
-    args = parser.parse_args()
-
+def run_command(args):
+    """Call the function that matches the command the user typed."""
     if args.command == "list-buckets":
         list_buckets()
     elif args.command == "list-files":
@@ -201,86 +190,32 @@ def main():
     elif args.command == "upload":
         upload_file(args.bucket, args.local_path)
     elif args.command == "download":
-        download_file(args.bucket, args.s3_key, args.destination)
+        download_file(args.bucket, args.key, args.destination)
     elif args.command == "organize":
         organize_bucket(args.bucket, dry_run=args.dry_run)
 
 
-if __name__ == "__main__":
-    main()
-
-
-def organize_bucket(bucket_name):
-    """
-    Organize files in a bucket into folders by file extension.
-    e.g. photo.jpg -> images/photo.jpg, report.pdf -> documents/report.pdf
-    """
-    s3 = get_s3_client()
-    extension_folders = {
-        "jpg": "images", "jpeg": "images", "png": "images", "gif": "images",
-        "pdf": "documents", "doc": "documents", "docx": "documents", "txt": "documents",
-        "mp4": "videos", "mov": "videos", "avi": "videos",
-        "mp3": "audio", "wav": "audio",
-        "zip": "archives", "tar": "archives", "gz": "archives",
-    }
+def main(argv=None):
+    """Run the CLI. Returns 0 on success and 1 on failure (used as the exit code)."""
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    args = build_parser().parse_args(argv)
 
     try:
-        response = s3.list_objects_v2(Bucket=bucket_name)
-        objects = response.get("Contents", [])
-        if not objects:
-            print(f"No files to organize in '{bucket_name}'.")
-            return
-
-        moved_count = 0
-        for obj in objects:
-            key = obj["Key"]
-            # Skip files that are already organized (already in a folder)
-            if "/" in key:
-                continue
-
-            extension = key.split(".")[-1].lower() if "." in key else ""
-            folder = extension_folders.get(extension, "other")
-            new_key = f"{folder}/{key}"
-
-            s3.copy_object(
-                Bucket=bucket_name,
-                CopySource={"Bucket": bucket_name, "Key": key},
-                Key=new_key,
-            )
-            s3.delete_object(Bucket=bucket_name, Key=key)
-            print(f"  Moved '{key}' -> '{new_key}'")
-            moved_count += 1
-
-        print(f"Organized {moved_count} file(s) in '{bucket_name}'.")
-    except ClientError as e:
-        print(f"Error organizing bucket: {e}")
-
-
-def print_usage():
-    print(__doc__)
-
-
-def main():
-    if len(sys.argv) < 2:
-        print_usage()
-        sys.exit(1)
-
-    command = sys.argv[1]
-
-    if command == "list-buckets":
-        list_buckets()
-    elif command == "list-files" and len(sys.argv) == 3:
-        list_files(sys.argv[2])
-    elif command == "upload" and len(sys.argv) == 4:
-        upload_file(sys.argv[2], sys.argv[3])
-    elif command == "download" and len(sys.argv) == 5:
-        download_file(sys.argv[2], sys.argv[3], sys.argv[4])
-    elif command == "organize" and len(sys.argv) == 3:
-        organize_bucket(sys.argv[2])
+        run_command(args)
+    except NoCredentialsError:
+        logger.error("AWS credentials not found. Run 'aws configure' first.")
+    except (ClientError, S3UploadFailedError) as e:
+        logger.error("AWS error: %s", e)
+    except BotoCoreError as e:
+        # e.g. no internet connection or an invalid region
+        logger.error("Could not talk to AWS: %s", e)
+    except OSError as e:
+        # Local file problems: missing upload file, bad download destination, ...
+        logger.error("File error: %s", e)
     else:
-        print_usage()
-        sys.exit(1)
+        return 0
+    return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
