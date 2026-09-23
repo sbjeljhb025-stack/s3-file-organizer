@@ -126,7 +126,7 @@ s3-file-organizer/
 
 ## Demo video
 
-[Link to unlisted YouTube demo — TODO: add once recorded]
+[https://www.youtube.com/watch?v=uaPVzr2T0Ag]
 
 ## What I'd add next
 
