@@ -132,7 +132,7 @@ def organize_bucket(bucket_name, dry_run=False):
         if dry_run:
             logger.info("  Would move '%s' -> '%s'", key, new_key)
         else:
-            # Copy first, delete second: if the copy fails, the original is untouched
+            # Copy .......first, delete second: if the copy fails, the original is untouched
             s3.copy_object(
                 Bucket=bucket_name,
                 CopySource={"Bucket": bucket_name, "Key": key},
