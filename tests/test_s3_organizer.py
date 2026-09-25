@@ -21,7 +21,7 @@ def make_mock_s3(pages_of_keys):
     """
     Build a fake S3 client whose paginator returns the given pages.
     pages_of_keys is a list of pages, each page a list of object keys.
-    An empty page mimics what S3 sends back for an empty bucket (no "Contents").
+    An empty page ## mimics what S3 sends back for an empty bucket (no "Contents").
     """
     s3 = MagicMock()
     pages = [
